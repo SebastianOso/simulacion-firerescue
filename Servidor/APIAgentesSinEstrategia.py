@@ -1171,15 +1171,40 @@ class SimulacionManager:
         
         # 3. Convertir el grid a lista de celdas
         celdas_estado = []
+
         for y in range(self.model.grid.height):
             for x in range(self.model.grid.width):
-                cell_value = int(grid_state[y][x])
-                if cell_value > 0:
+
+                objetos = []
+
+                # Primero agrega fuego/humo/POIs/víctimas
+                contenido = self.model.cells[x][y]
+                if contenido != 0:
+                    objetos.append(int(contenido))
+
+                # Luego agrega agentes que estén en esa celda
+                agentes_en_celda = self.model.grid.get_cell_list_contents([(x, y)])
+                for ag in agentes_en_celda:
+                    if isinstance(ag, Cascanueces):
+                        objetos.append(7 if ag.carrying else 6)
+
+                # Finalmente agrega base (si aplica)
+                if (x, y) in [
+                    self.model.pos_base1,
+                    self.model.pos_base2,
+                    self.model.pos_base3,
+                    self.model.pos_base4
+                ]:
+                    objetos.append(8)
+
+                # Si hay algo en la celda, lo incluimos
+                if objetos:
                     celdas_estado.append({
                         "x": x,
                         "y": y,
-                        "tipo": cell_value
+                        "objetos": objetos
                     })
+
         
         # 4. Obtener estado de paredes
         paredes_estado = []
