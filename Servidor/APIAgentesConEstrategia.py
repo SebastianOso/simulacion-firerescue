@@ -1,13 +1,16 @@
-# %%
+# Instalación de dependencias
+# !pip install numpy scipy matplotlib seaborn scikit-learn mesa -q
+
+# Imports
 from mesa import Agent, Model
 from mesa.space import MultiGrid
 from mesa.datacollection import DataCollector
+from mesa.batchrunner import batch_run
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from matplotlib.colors import ListedColormap
 import matplotlib.patches as patches
-from mesa.batchrunner import batch_run
 from matplotlib.patches import Patch
 from IPython.display import HTML
 plt.rcParams["animation.html"] = "jshtml"
@@ -17,7 +20,9 @@ import pandas as pd
 import seaborn as sns
 import random
 import copy
+import heapq
 sns.set()
+
 
 #Librerias para el servidor de Phyton
 
@@ -26,8 +31,9 @@ import logging
 import json
 
 
-# %%
-bits =  [
+
+# Configuración del mapa (igual que antes)
+bits = [
     ["00110","00100","00100","00100","01103","00113","01103","01113"],
     ["10010","10000","10000","10003","11000","10010","11000","11010"],
     ["00110","01100","00110","00103","00100","01103","00113","01100"],
@@ -37,7 +43,6 @@ bits =  [
 ]
 
 def decode(cell):
-    # 1. Determinar el estado de la puerta (cerrado/abierto/sin_puerta)
     if cell[4] == "3":
         estado = "cerrado"
     elif cell[4] == "4":
@@ -74,7 +79,6 @@ def generar_tablero_json():
     }
     
     return resultado
-
 
 def can_move(model, x, y, nx, ny):
     if not (0 <= nx < model.grid.width and 0 <= ny < model.grid.height):
@@ -138,8 +142,114 @@ def get_door_direction(x, y, nx, ny):
         return "left"
     return None
 
+# ==================== NUEVAS FUNCIONES PARA DIJKSTRA ====================
+
+def calcular_costo_movimiento(model, x, y, nx, ny, carrying=False):
+    """
+    Calcula el costo en PA para moverse de (x,y) a (nx,ny)
+    """
+    move_result = can_move(model, x, y, nx, ny)
+    
+    if move_result == False:
+        return float('inf')  # No se puede mover
+    
+    costo_base = 2 if carrying else 1
+    
+    # Si hay fuego en el destino, cuesta más
+    if model.cells[nx][ny] == 2:
+        costo_base = 2
+    
+    # Si hay una puerta cerrada, añadir el costo de abrirla
+    if move_result == "puerta_cerrada":
+        costo_base += 1
+    
+    return costo_base
+
+def dijkstra(model, start, goal, carrying=False, open_doors=True):
+    """
+    Implementación de Dijkstra para encontrar el camino más corto
+    start: tupla (x, y) posición inicial
+    goal: tupla (x, y) posición objetivo
+    carrying: bool, si está cargando una víctima
+    open_doors: bool, si puede abrir puertas
+    
+    Retorna: (costo_total, lista_de_posiciones)
+    """
+    if start == goal:
+        return (0, [start])
+    
+    # Cola de prioridad: (costo, posicion)
+    pq = [(0, start)]
+    # Diccionario de costos
+    costos = {start: 0}
+    # Diccionario de padres para reconstruir el camino
+    padres = {start: None}
+    
+    while pq:
+        costo_actual, pos_actual = heapq.heappop(pq)
+        
+        if pos_actual == goal:
+            # Reconstruir camino
+            camino = []
+            pos = goal
+            while pos is not None:
+                camino.append(pos)
+                pos = padres[pos]
+            camino.reverse()
+            return (costo_actual, camino)
+        
+        # Si ya encontramos un camino mejor, ignorar
+        if costo_actual > costos.get(pos_actual, float('inf')):
+            continue
+        
+        x, y = pos_actual
+        vecinos = model.grid.get_neighborhood(pos_actual, moore=False, include_center=False)
+        
+        for nx, ny in vecinos:
+            costo_movimiento = calcular_costo_movimiento(model, x, y, nx, ny, carrying)
+            
+            # Si no se puede abrir puertas y hay una puerta cerrada, no considerar
+            if not open_doors and can_move(model, x, y, nx, ny) == "puerta_cerrada":
+                continue
+            
+            # Si el costo es infinito, no se puede pasar
+            if costo_movimiento == float('inf'):
+                continue
+            
+            nuevo_costo = costo_actual + costo_movimiento
+            
+            if nuevo_costo < costos.get((nx, ny), float('inf')):
+                costos[(nx, ny)] = nuevo_costo
+                padres[(nx, ny)] = pos_actual
+                heapq.heappush(pq, (nuevo_costo, (nx, ny)))
+    
+    # No hay camino
+    return (float('inf'), [])
+
+def encontrar_objetivo_mas_cercano(model, pos_agente, objetivos, carrying=False):
+    """
+    Encuentra el objetivo más cercano usando Dijkstra
+    objetivos: lista de tuplas (x, y)
+    
+    Retorna: (objetivo, costo, camino)
+    """
+    mejor_objetivo = None
+    mejor_costo = float('inf')
+    mejor_camino = []
+    
+    for objetivo in objetivos:
+        costo, camino = dijkstra(model, pos_agente, objetivo, carrying)
+        if costo < mejor_costo:
+            mejor_costo = costo
+            mejor_objetivo = objetivo
+            mejor_camino = camino
+    
+    return (mejor_objetivo, mejor_costo, mejor_camino)
+
+# PARTE 2: Clase Cascanueces Modificada con Roles
+
 class Cascanueces(Agent):
-    def __init__(self, model, base_pos):
+    def __init__(self, model, base_pos, rol="apagafuegos"):
         super().__init__(model)
         self.carrying = False
         self.PA = 4
@@ -152,7 +262,12 @@ class Cascanueces(Agent):
         self.base_pos = base_pos
         self.victimas_salvadas = 0
         self.veces_afectado_explosion = 0
-
+        
+        # NUEVO: Rol del agente
+        self.rol = rol  # "apagafuegos" o "rescatista"
+        self.objetivo_actual = None
+        self.camino_actual = []
+        
     def reset_pa(self):
         self.PA = self.MAX_PA + self.PA_guardados
         self.PA_guardados = 0
@@ -168,6 +283,9 @@ class Cascanueces(Agent):
         if self.carrying:
             self.carrying = False
         self.veces_afectado_explosion += 1
+        # Limpiar objetivo y camino al ser afectado
+        self.objetivo_actual = None
+        self.camino_actual = []
 
     def open_door(self, direction):
         if self.PA >= 1:
@@ -245,43 +363,6 @@ class Cascanueces(Agent):
             return True
         return False
 
-    def random_position(self):
-        (x, y) = self.pos
-
-        possible_positions = self.model.grid.get_neighborhood(
-            self.pos, moore=False, include_center=False
-        )
-
-        valid_moves = []
-        doors_to_open = []
-
-        for (nx, ny) in possible_positions:
-            move_result = can_move(self.model, x, y, nx, ny)
-
-            if move_result == "puerta_cerrada":
-                direction = get_door_direction(x, y, nx, ny)
-                if direction:
-                    doors_to_open.append((nx, ny, direction))
-            elif move_result:
-                valid_moves.append((nx, ny))
-
-        all_options = valid_moves + doors_to_open
-
-        if not all_options:
-            return (x, y)
-
-        chosen = random.choice(all_options)
-
-        if len(chosen) == 3:
-            nx, ny, direction = chosen
-            if self.PA >= 1:
-                if self.open_door(direction):
-                    if can_move(self.model, x, y, nx, ny) == True:
-                        return (nx, ny)
-            return (x, y)
-        else:
-            return chosen
-
     def descubrir_poi(self, x, y):
         if self.PA >= 1 and self.model.cells[x][y] == 3:
             self.PA -= 1
@@ -301,40 +382,188 @@ class Cascanueces(Agent):
                 return 'falsa'
         return None
 
-    def ejecutar_accion(self):
+    # ==================== NUEVAS FUNCIONES DE ESTRATEGIA ====================
+    
+    def encontrar_objetivos_rol(self):
+        """
+        Encuentra objetivos según el rol del agente
+        """
+        objetivos = []
+        
+        if self.rol == "apagafuegos":
+            # Buscar fuegos y humos
+            for x in range(self.model.grid.width):
+                for y in range(self.model.grid.height):
+                    if self.model.cells[x][y] == 2:  # Fuego
+                        objetivos.append((x, y, 'fuego'))
+                    elif self.model.cells[x][y] == 1:  # Humo
+                        objetivos.append((x, y, 'humo'))
+        
+        elif self.rol == "rescatista":
+            # Buscar POIs y víctimas
+            for x in range(self.model.grid.width):
+                for y in range(self.model.grid.height):
+                    if self.model.cells[x][y] == 3:  # POI sin descubrir
+                        objetivos.append((x, y, 'poi'))
+                    elif self.model.cells[x][y] == 4:  # Víctima identificada
+                        objetivos.append((x, y, 'victima'))
+        
+        return objetivos
+    
+    def seleccionar_objetivo(self):
+        """
+        Selecciona el mejor objetivo según el rol
+        """
+        if self.rol == "apagafuegos":
+            objetivos = self.encontrar_objetivos_rol()
+            if not objetivos:
+                return None, None, []
+            
+            # Priorizar fuegos sobre humos
+            fuegos = [(x, y) for x, y, tipo in objetivos if tipo == 'fuego']
+            humos = [(x, y) for x, y, tipo in objetivos if tipo == 'humo']
+            
+            if fuegos:
+                objetivo, costo, camino = encontrar_objetivo_mas_cercano(
+                    self.model, self.pos, fuegos, self.carrying
+                )
+                return objetivo, 'fuego', camino
+            elif humos:
+                objetivo, costo, camino = encontrar_objetivo_mas_cercano(
+                    self.model, self.pos, humos, self.carrying
+                )
+                return objetivo, 'humo', camino
+        
+        elif self.rol == "rescatista":
+            # Si está cargando víctima, ir a la base más cercana
+            if self.carrying:
+                bases = [
+                    self.model.pos_base1,
+                    self.model.pos_base2,
+                    self.model.pos_base3,
+                    self.model.pos_base4
+                ]
+                objetivo, costo, camino = encontrar_objetivo_mas_cercano(
+                    self.model, self.pos, bases, True
+                )
+                return objetivo, 'base', camino
+            
+            # Si no está cargando, buscar POIs o víctimas
+            objetivos = self.encontrar_objetivos_rol()
+            if not objetivos:
+                return None, None, []
+            
+            # Priorizar víctimas identificadas sobre POIs
+            victimas = [(x, y) for x, y, tipo in objetivos if tipo == 'victima']
+            pois = [(x, y) for x, y, tipo in objetivos if tipo == 'poi']
+            
+            if victimas:
+                objetivo, costo, camino = encontrar_objetivo_mas_cercano(
+                    self.model, self.pos, victimas, False
+                )
+                return objetivo, 'victima', camino
+            elif pois:
+                objetivo, costo, camino = encontrar_objetivo_mas_cercano(
+                    self.model, self.pos, pois, False
+                )
+                return objetivo, 'poi', camino
+        
+        return None, None, []
+    
+    def mover_hacia_objetivo(self, camino):
+        """
+        Mueve al agente siguiendo el camino hacia el objetivo
+        """
+        if len(camino) < 2:
+            return False
+        
+        x, y = self.pos
+        siguiente_pos = camino[1]  # El siguiente paso en el camino
+        nx, ny = siguiente_pos
+        
+        # Verificar si hay puerta cerrada
+        move_result = can_move(self.model, x, y, nx, ny)
+        
+        if move_result == "puerta_cerrada":
+            direction = get_door_direction(x, y, nx, ny)
+            if direction and self.PA >= 1:
+                if self.open_door(direction):
+                    # Puerta abierta, intentar mover
+                    if can_move(self.model, x, y, nx, ny) == True:
+                        return self.move(siguiente_pos)
+            return False
+        elif move_result == True:
+            return self.move(siguiente_pos)
+        
+        return False
+    
+    def ejecutar_accion_estrategica(self):
+        """
+        Ejecuta acciones basadas en la estrategia del rol
+        """
         if self.PA <= 0:
             return False
         
         (x, y) = self.pos
         
-        if self.model.cells[x][y] == 2:
-            if self.PA >= 2:
-                self.model.cells[x][y] = 0
-                self.fuegos_apagados += 1
-                self.model.fuegos_totales_apagados += 1
-                self.PA -= 2
-                return True
-            else:
-                return False
-        
-        bases_disponibles = [
-            self.model.pos_base1,
-            self.model.pos_base2,
-            self.model.pos_base3,
-            self.model.pos_base4
-        ]
-
-        if self.pos in bases_disponibles and self.carrying:
-            self.carrying = False
-            self.victimas_salvadas += 1
-            self.model.victims_rescued += 1
-            self.model.victimas_en_mapa -= 1
-            self.model.spawn_nuevo_poi()
+        # Caso especial: Si está en fuego, apagarlo primero
+        if self.model.cells[x][y] == 2 and self.PA >= 2:
+            self.model.cells[x][y] = 0
+            self.fuegos_apagados += 1
+            self.model.fuegos_totales_apagados += 1
+            self.PA -= 2
+            self.objetivo_actual = None
+            self.camino_actual = []
             return True
-
-        new_pos = self.random_position()
-
-        if new_pos == self.pos:
+        
+        # Si el objetivo actual ya no es válido, seleccionar uno nuevo
+        if not self.objetivo_actual or not self.camino_actual:
+            self.objetivo_actual, tipo_objetivo, self.camino_actual = self.seleccionar_objetivo()
+            
+            if not self.objetivo_actual:
+                return False  # No hay objetivos
+        
+        # Verificar si llegamos al objetivo
+        if self.pos == self.objetivo_actual:
+            resultado = self.ejecutar_accion_en_objetivo()
+            self.objetivo_actual = None
+            self.camino_actual = []
+            return resultado
+        
+        # Moverse hacia el objetivo
+        if self.mover_hacia_objetivo(self.camino_actual):
+            # Actualizar camino (quitar la posición actual)
+            if len(self.camino_actual) > 0 and self.camino_actual[0] == (x, y):
+                self.camino_actual.pop(0)
+            
+            # Verificar acciones en la nueva posición
+            nx, ny = self.pos
+            
+            # Apagar humo si está en uno
+            if self.model.cells[nx][ny] == 1 and self.PA >= 1:
+                self.model.cells[nx][ny] = 0
+                self.humos_apagados += 1
+                self.PA -= 1
+            
+            # Descubrir POI si está en uno
+            elif self.model.cells[nx][ny] == 3 and self.PA >= 1:
+                self.descubrir_poi(nx, ny)
+            
+            return True
+        
+        # Si no pudo moverse, recalcular camino
+        self.objetivo_actual = None
+        self.camino_actual = []
+        return False
+    
+    def ejecutar_accion_en_objetivo(self):
+        """
+        Ejecuta la acción correspondiente al llegar al objetivo
+        """
+        x, y = self.pos
+        
+        if self.rol == "apagafuegos":
+            # Apagar fuego o humo
             if self.model.cells[x][y] == 2 and self.PA >= 2:
                 self.model.cells[x][y] = 0
                 self.fuegos_apagados += 1
@@ -346,61 +575,45 @@ class Cascanueces(Agent):
                 self.humos_apagados += 1
                 self.PA -= 1
                 return True
-            elif self.model.cells[x][y] == 3 and self.PA >= 1:
+        
+        elif self.rol == "rescatista":
+            bases_disponibles = [
+                self.model.pos_base1,
+                self.model.pos_base2,
+                self.model.pos_base3,
+                self.model.pos_base4
+            ]
+            
+            # Si está en base con víctima, dejarla
+            if self.pos in bases_disponibles and self.carrying:
+                self.carrying = False
+                self.victimas_salvadas += 1
+                self.model.victims_rescued += 1
+                self.model.victimas_en_mapa -= 1
+                self.model.spawn_nuevo_poi()
+                return True
+            
+            # Descubrir POI
+            if self.model.cells[x][y] == 3 and self.PA >= 1:
                 resultado = self.descubrir_poi(x, y)
                 return resultado is not None
             
-            fuegos_ady, humos_ady = self.puede_apagar_adyacente()
-            
-            if fuegos_ady and self.PA >= 2:
-                target = random.choice(fuegos_ady)
-                return self.apagar_adyacente(target[0], target[1])
-            
-            if humos_ady and self.PA >= 1:
-                target = random.choice(humos_ady)
-                return self.apagar_adyacente(target[0], target[1])
-            
-            return False
-
-        (nx, ny) = new_pos
-        
-        if self.model.cells[nx][ny] == 2:
-            costo_mover = 2 if self.carrying else 1
-            costo_total = 2 + costo_mover
-            
-            if self.PA >= costo_total:
-                self.model.cells[nx][ny] = 0
-                self.fuegos_apagados += 1
-                self.model.fuegos_totales_apagados += 1
-                self.PA -= 2
-                self.PA -= costo_mover
-                self.model.grid.move_agent(self, new_pos)
+            # Recoger víctima
+            if self.model.cells[x][y] == 4 and self.PA >= 1 and not self.carrying:
+                self.model.cells[x][y] = 0
+                self.carrying = True
+                self.PA -= 1
                 return True
-            else:
-                return False
         
-        costo_movimiento = 2 if self.carrying else 1
-        
-        if self.PA < costo_movimiento:
-            return False
-        
-        self.PA -= costo_movimiento
-        self.model.grid.move_agent(self, new_pos)
-        
-        if self.model.cells[nx][ny] == 1 and self.PA >= 1:
-            self.model.cells[nx][ny] = 0
-            self.humos_apagados += 1
-            self.PA -= 1
-        
-        elif self.model.cells[nx][ny] == 3 and self.PA >= 1:
-            self.descubrir_poi(nx, ny)
-        
-        elif self.model.cells[nx][ny] == 4 and self.PA >= 1 and not self.carrying:
-            self.model.cells[nx][ny] = 0
-            self.carrying = True
-            self.PA -= 1
-        
-        return True
+        return False
+    
+    def ejecutar_accion(self):
+        """
+        Función principal que ejecuta acciones (ahora usa estrategia)
+        """
+        return self.ejecutar_accion_estrategica()
+
+# PARTE 3: Funciones auxiliares y Modelo
 
 def get_grid(model):
     grid = np.zeros((model.grid.height, model.grid.width))
@@ -424,8 +637,9 @@ def get_grid(model):
 def get_walls_copy(model):
     return copy.deepcopy(model.walls)
 
+
 class FoodCollectionModel(Model):
-    def __init__(self, width=8, height=6, num_agents=6):
+    def __init__(self, width=8, height=6, num_agents=6, num_apagafuegos=3, num_rescatistas=3):
         super().__init__()
         self.grid = MultiGrid(width, height, torus=False)
         self.num_agents = num_agents
@@ -446,6 +660,7 @@ class FoodCollectionModel(Model):
         self.cells = np.zeros((width, height))
         self.walls = [[decode(cell) for cell in fila] for fila in bits]
 
+        # Colocar fuegos iniciales
         fuegos_placed = 0
         while fuegos_placed < 10:
             x = self.random.randrange(width)
@@ -454,6 +669,7 @@ class FoodCollectionModel(Model):
                 self.cells[x][y] = 2
                 fuegos_placed += 1
 
+        # Colocar POIs iniciales
         tipos_poi = ['victima', 'victima', 'falsa']
         random.shuffle(tipos_poi)
 
@@ -467,6 +683,7 @@ class FoodCollectionModel(Model):
                 self.victimas_en_mapa += 1
                 pdi_placed += 1
 
+        # Definir bases
         self.pos_base1 = (0, 3)
         self.pos_base2 = (2, 0)
         self.pos_base3 = (5, 5)
@@ -474,38 +691,48 @@ class FoodCollectionModel(Model):
 
         bases = [self.pos_base1, self.pos_base2, self.pos_base3, self.pos_base4]
 
+        # Crear agentes con roles
         self.lista_agentes = []
-        for i in range(num_agents):
+        
+        # Crear apagafuegos
+        for i in range(num_apagafuegos):
             base_pos = random.choice(bases)
-            casca = Cascanueces(self, base_pos)
-            self.grid.place_agent(casca, (
-                self.random.randrange(width),
-                self.random.randrange(height)
-            ))
+            casca = Cascanueces(self, base_pos, rol="apagafuegos")
+            self.grid.place_agent(casca, base_pos)
+            self.lista_agentes.append(casca)
+        
+        # Crear rescatistas
+        for i in range(num_rescatistas):
+            base_pos = random.choice(bases)
+            casca = Cascanueces(self, base_pos, rol="rescatista")
+            self.grid.place_agent(casca, base_pos)
             self.lista_agentes.append(casca)
 
         self.datacollector = DataCollector(
-          model_reporters={
-              "Grid": get_grid,
-              "Steps": lambda m: m.steps_count,
-              "FuegosApagados": lambda m: m.fuegos_totales_apagados,
-              "VictimasRescatadas": lambda m: m.victims_rescued,
-              "VictimasEnMapa": lambda m: m.victimas_en_mapa,
-              "FalsasAlarmas": lambda m: m.falsas_alarmas_descubiertas,
-              "VictimasMuertas": lambda m: m.victimas_muertas,
-              "Walls": get_walls_copy,
-              "DanioEstructural": lambda m: m.damage_count,
-              "TurnoActual": lambda m: m.turno_actual,
-              "CascanuecesAfectados": lambda m: m.cascanueces_afectados_total,
-          },
-          agent_reporters={
-              "PA": "PA",
-              "FuegosApagados": "fuegos_apagados",
-              "HumosApagados": "humos_apagados",
-              "PuertasAbiertas": "puertas_abiertas",
-              "VecesAfectado": "veces_afectado_explosion",
-          }
-      )
+            model_reporters={
+                "Grid": get_grid,
+                "Steps": lambda m: m.steps_count,
+                "FuegosApagados": lambda m: m.fuegos_totales_apagados,
+                "VictimasRescatadas": lambda m: m.victims_rescued,
+                "VictimasEnMapa": lambda m: m.victimas_en_mapa,
+                "FalsasAlarmas": lambda m: m.falsas_alarmas_descubiertas,
+                "VictimasMuertas": lambda m: m.victimas_muertas,
+                "Walls": get_walls_copy,
+                "DanioEstructural": lambda m: m.damage_count,
+                "TurnoActual": lambda m: m.turno_actual,
+                "CascanuecesAfectados": lambda m: m.cascanueces_afectados_total,
+            },
+            agent_reporters={
+                "PA": "PA",
+                "FuegosApagados": "fuegos_apagados",
+                "HumosApagados": "humos_apagados",
+                "PuertasAbiertas": "puertas_abiertas",
+                "VecesAfectado": "veces_afectado_explosion",
+                "Rol": "rol",
+                "VictimasSalvadas": "victimas_salvadas",
+            }
+        )
+        
     def propagar_fuego_a_humos_adyacentes(self, x, y):
         adyacentes = self.grid.get_neighborhood(
             (x, y),
@@ -580,6 +807,7 @@ class FoodCollectionModel(Model):
             intentos += 1
 
         return False
+        
     def explosion(self, x, y):
         self.check_cascanueces_en_posicion(x, y)
 
@@ -830,6 +1058,7 @@ class FoodCollectionModel(Model):
         if self.turno_actual == 0:
             self.steps_count += 1
 
+# PARTE 4: Visualización y Ejecución
 '''''''''
 def draw_walls(ax, walls):
     height = len(walls)
@@ -911,38 +1140,114 @@ def draw_walls(ax, walls):
                         col = "black"
                     ax.plot([x0, x0], [y0, y1], color=col, linewidth=4, solid_capstyle="butt")
 
+
+# ==================== EJECUCIÓN DE LA SIMULACIÓN ====================
+
+print("="*60)
+print("FLASH POINT FIRE RESCUE - SIMULACIÓN CON ESTRATEGIA")
+print("="*60)
+
+# Crear modelo con roles definidos
 model = FoodCollectionModel(
     width=8,
     height=6,
-    num_agents=3
+    num_agents=6,
+    num_apagafuegos=3,  # 3 agentes para apagar fuego
+    num_rescatistas=3   # 3 agentes para rescatar víctimas
 )
+
+print("\nCONFIGURACIÓN DE AGENTES:")
+print("-" * 60)
+for idx, agent in enumerate(model.lista_agentes):
+    print(f"Agente {idx} (ID: {agent.unique_id}): Rol = {agent.rol.upper()}, Base = {agent.base_pos}")
+
+print("\n" + "="*60)
+print("INICIANDO SIMULACIÓN...")
+print("="*60 + "\n")
 
 MAX_STEPS = 200
 total_turnos = 0
 while not model.game_over() and total_turnos < MAX_STEPS:
     model.step()
     total_turnos += 1
+    
+    # Mostrar progreso cada 10 turnos
+    if total_turnos % 10 == 0:
+        print(f"Turno {total_turnos}: Víctimas={model.victims_rescued}/{model.victimas_totales}, "
+              f"Fuegos={model.fuegos_totales_apagados}, Daño={model.damage_count}/24")
 
-print(f"\nSIMULACION COMPLETADA")
+print("\n" + "="*60)
+print("SIMULACIÓN COMPLETADA")
+print("="*60)
 print(f"Turnos totales ejecutados: {total_turnos}")
 print(f"Rondas completadas: {model.steps_count}")
 print(f"Fuegos apagados: {model.fuegos_totales_apagados}/10")
-print(f"Victimas rescatadas: {model.victims_rescued}/{model.victimas_totales}")
+print(f"Víctimas rescatadas: {model.victims_rescued}/{model.victimas_totales}")
+print(f"Víctimas muertas: {model.victimas_muertas}/5")
+print(f"Falsas alarmas: {model.falsas_alarmas_descubiertas}")
 print(f"Daño estructural: {model.damage_count}/24")
 print(f"Cascanueces afectados por explosiones: {model.cascanueces_afectados_total}\n")
 
-print("\nESTADISTICAS POR AGENTE:")
-print("-" * 50)
-for idx, agent in enumerate(model.lista_agentes):
-    print(f"\nCascanueces {idx} (ID: {agent.unique_id}):")
-    print(f"  Fuegos apagados: {agent.fuegos_apagados}")
-    print(f"  Humos apagados: {agent.humos_apagados}")
-    print(f"  Puertas abiertas: {agent.puertas_abiertas}")
-    print(f"  Victimas salvadas: {agent.victimas_salvadas}")
-    print(f"  Veces afectado por explosion: {agent.veces_afectado_explosion}")
-    print(f"  PA restante: {agent.PA}/{agent.MAX_PA}")
-    print(f"  Llevando victima: {'Si' if agent.carrying else 'No'}")
-    print(f"  Base asignada: {agent.base_pos}")
+# Determinar resultado
+if model.victims_rescued >= model.victimas_totales:
+    print("🏆 ¡VICTORIA! Todas las víctimas fueron rescatadas.")
+elif model.damage_count >= 24:
+    print("💥 DERROTA: El edificio colapsó.")
+elif model.victimas_muertas >= 4:
+    print("😢 DERROTA: Murieron demasiadas víctimas.")
+else:
+    print("⏱️ TIEMPO AGOTADO")
+
+print("\n" + "="*60)
+print("ESTADÍSTICAS POR AGENTE")
+print("="*60)
+
+# Separar agentes por rol
+apagafuegos = [agent for agent in model.lista_agentes if agent.rol == "apagafuegos"]
+rescatistas = [agent for agent in model.lista_agentes if agent.rol == "rescatista"]
+
+print("\n🔥 APAGAFUEGOS:")
+print("-" * 60)
+for agent in apagafuegos:
+    print(f"\nAgente {agent.unique_id} (Base: {agent.base_pos}):")
+    print(f"  ├─ Fuegos apagados: {agent.fuegos_apagados}")
+    print(f"  ├─ Humos apagados: {agent.humos_apagados}")
+    print(f"  ├─ Puertas abiertas: {agent.puertas_abiertas}")
+    print(f"  ├─ Veces afectado por explosión: {agent.veces_afectado_explosion}")
+    print(f"  └─ PA restante: {agent.PA}/{agent.MAX_PA}")
+
+print("\n🚑 RESCATISTAS:")
+print("-" * 60)
+for agent in rescatistas:
+    print(f"\nAgente {agent.unique_id} (Base: {agent.base_pos}):")
+    print(f"  ├─ Víctimas salvadas: {agent.victimas_salvadas}")
+    print(f"  ├─ Puertas abiertas: {agent.puertas_abiertas}")
+    print(f"  ├─ Fuegos apagados: {agent.fuegos_apagados}")
+    print(f"  ├─ Humos apagados: {agent.humos_apagados}")
+    print(f"  ├─ Veces afectado por explosión: {agent.veces_afectado_explosion}")
+    print(f"  ├─ Llevando víctima: {'Sí' if agent.carrying else 'No'}")
+    print(f"  └─ PA restante: {agent.PA}/{agent.MAX_PA}")
+
+print("\n" + "="*60)
+print("COMPARACIÓN DE EFICIENCIA")
+print("="*60)
+
+total_fuegos_apagafuegos = sum(a.fuegos_apagados for a in apagafuegos)
+total_humos_apagafuegos = sum(a.humos_apagados for a in apagafuegos)
+total_victimas_rescatistas = sum(a.victimas_salvadas for a in rescatistas)
+
+print(f"\n🔥 Apagafuegos:")
+print(f"  ├─ Total fuegos apagados: {total_fuegos_apagafuegos}")
+print(f"  ├─ Total humos apagados: {total_humos_apagafuegos}")
+print(f"  └─ Promedio fuegos/agente: {total_fuegos_apagafuegos/len(apagafuegos):.2f}")
+
+print(f"\n🚑 Rescatistas:")
+print(f"  ├─ Total víctimas salvadas: {total_victimas_rescatistas}")
+print(f"  └─ Promedio víctimas/agente: {total_victimas_rescatistas/len(rescatistas):.2f}")
+
+print("\n" + "="*60)
+
+# PARTE 5: Animación
 
 model_info = model.datacollector.get_model_vars_dataframe()
 agent_info = model.datacollector.get_agent_vars_dataframe()
@@ -950,7 +1255,7 @@ agent_info = model.datacollector.get_agent_vars_dataframe()
 fig, axs = plt.subplots(figsize=(12, 10))
 axs.set_xticks([])
 axs.set_yticks([])
-axs.set_title("Simulacion Flash Point Fire Rescue", fontsize=14, fontweight='bold')
+axs.set_title("Simulación Flash Point Fire Rescue - CON ESTRATEGIA", fontsize=14, fontweight='bold')
 colors = ['white', 'gray', 'red', 'yellow', 'orange', 'pink', 'blue', 'cyan', 'green']
 
 n_bins = 9
@@ -966,10 +1271,10 @@ legend_elements = [
     Patch(facecolor='gray', label='Humo'),
     Patch(facecolor='red', label='Fuego'),
     Patch(facecolor='yellow', label='POI sin descubrir'),
-    Patch(facecolor='orange', label='Victima real'),
+    Patch(facecolor='orange', label='Víctima real'),
     Patch(facecolor='pink', label='Falsa alarma'),
     Patch(facecolor='blue', label='Cascanueces'),
-    Patch(facecolor='cyan', label='Cascanueces c/victima'),
+    Patch(facecolor='cyan', label='Cascanueces c/víctima'),
     Patch(facecolor='#8B4513', label='Puerta cerrada'),
     Patch(facecolor='#90EE90', label='Puerta abierta')
 ]
@@ -978,7 +1283,7 @@ def animate(i):
     axs.clear()
     axs.set_xticks([])
     axs.set_yticks([])
-    axs.set_title("Simulacion Flash Point Fire Rescue", fontsize=14, fontweight='bold')
+    axs.set_title("Simulación Flash Point Fire Rescue - CON ESTRATEGIA", fontsize=14, fontweight='bold')
 
     axs.imshow(model_info.iloc[i]['Grid'], cmap=cmap, vmin=0, vmax=8, origin='lower')
 
@@ -1001,51 +1306,84 @@ def animate(i):
                          bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9))
 
     step_info.set_text(
-    f'Frame: {i}\n'
-    f'Turno actual: Agente {turno}\n'
-    f'Fuegos apagados: {fuegos}/10\n'
-    f'Victimas rescatadas: {victimas_rescatadas}/{model.victimas_totales}\n'
-    f'Victimas muertas: {victimas_muertas}/5\n'
-    f'POIs en mapa: {victimas_mapa}\n'
-    f'Falsas alarmas: {falsas_alarmas}\n'
-    f'Daño estructural: {danio}/24\n'
-    f'Cascanueces afectados: {cascanueces_afectados}'
-)
+        f'Frame: {i}\n'
+        f'Turno actual: Agente {turno}\n'
+        f'Fuegos apagados: {fuegos}/10\n'
+        f'Víctimas rescatadas: {victimas_rescatadas}/{model.victimas_totales}\n'
+        f'Víctimas muertas: {victimas_muertas}/5\n'
+        f'POIs en mapa: {victimas_mapa}\n'
+        f'Falsas alarmas: {falsas_alarmas}\n'
+        f'Daño estructural: {danio}/24\n'
+        f'Cascanueces afectados: {cascanueces_afectados}'
+    )
 
     try:
         agent_data = agent_info.xs(i, level='Step')
-        pa_info = "PA de Cascanueces:\n" + "=" * 30 + "\n"
+        
+        # Separar por rol
+        apagafuegos_ids = [agent.unique_id for agent in model.lista_agentes if agent.rol == "apagafuegos"]
+        rescatistas_ids = [agent.unique_id for agent in model.lista_agentes if agent.rol == "rescatista"]
+        
+        pa_info = "AGENTES CON ESTRATEGIA\n" + "=" * 40 + "\n"
+        
+        # Mostrar apagafuegos
+        pa_info += "\n🔥 APAGAFUEGOS:\n"
+        for agent_id in sorted(apagafuegos_ids):
+            if agent_id in agent_data.index:
+                pa = int(agent_data.loc[agent_id, 'PA'])
+                fuegos_ag = int(agent_data.loc[agent_id, 'FuegosApagados'])
+                humos_ag = int(agent_data.loc[agent_id, 'HumosApagados'])
+                puertas_ag = int(agent_data.loc[agent_id, 'PuertasAbiertas'])
+                veces_afectado = int(agent_data.loc[agent_id, 'VecesAfectado'])
 
-        for agent_id in sorted(agent_data.index):
-            pa = int(agent_data.loc[agent_id, 'PA'])
-            fuegos_ag = int(agent_data.loc[agent_id, 'FuegosApagados'])
-            humos_ag = int(agent_data.loc[agent_id, 'HumosApagados'])
-            puertas_ag = int(agent_data.loc[agent_id, 'PuertasAbiertas'])
-            veces_afectado = int(agent_data.loc[agent_id, 'VecesAfectado'])
+                if agent_id == turno:
+                    pa_info += f"> Ag.{agent_id}: PA={pa}/4 *\n"
+                else:
+                    pa_info += f"  Ag.{agent_id}: PA={pa}/4\n"
+                pa_info += f"  🔥:{fuegos_ag} 💨:{humos_ag} 🚪:{puertas_ag}"
+                if veces_afectado > 0:
+                    pa_info += f" 💥:{veces_afectado}"
+                pa_info += "\n"
+        
+        # Mostrar rescatistas
+        pa_info += "\n🚑 RESCATISTAS:\n"
+        for agent_id in sorted(rescatistas_ids):
+            if agent_id in agent_data.index:
+                pa = int(agent_data.loc[agent_id, 'PA'])
+                victimas_ag = int(agent_data.loc[agent_id, 'VictimasSalvadas'])
+                puertas_ag = int(agent_data.loc[agent_id, 'PuertasAbiertas'])
+                veces_afectado = int(agent_data.loc[agent_id, 'VecesAfectado'])
 
-            if agent_id == turno:
-                pa_info += f"> Agente {agent_id}: PA={pa}/4 *\n"
-            else:
-                pa_info += f"  Agente {agent_id}: PA={pa}/4\n"
-            pa_info += f"  Fuego:{fuegos_ag} Humo:{humos_ag} Puertas:{puertas_ag}"
-            if veces_afectado > 0:
-                pa_info += f" Explosiones:{veces_afectado}"
-            pa_info += "\n"
+                if agent_id == turno:
+                    pa_info += f"> Ag.{agent_id}: PA={pa}/4 *\n"
+                else:
+                    pa_info += f"  Ag.{agent_id}: PA={pa}/4\n"
+                pa_info += f"  👥:{victimas_ag} 🚪:{puertas_ag}"
+                if veces_afectado > 0:
+                    pa_info += f" 💥:{veces_afectado}"
+                pa_info += "\n"
 
         pa_stats = axs.text(0.02, 0.50, '', transform=axs.transAxes,
                             fontsize=9, verticalalignment='top', family='monospace',
                             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
         pa_stats.set_text(pa_info)
-    except:
+    except Exception as e:
         pa_stats = axs.text(0.02, 0.50, '', transform=axs.transAxes,
                             fontsize=9, verticalalignment='top', family='monospace',
                             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.9))
-        pa_stats.set_text("PA de Cascanueces:\nCargando...")
+        pa_stats.set_text("Agentes:\nCargando...")
+
+print("\n" + "="*60)
+print("GENERANDO ANIMACIÓN...")
+print("="*60)
 
 anim = animation.FuncAnimation(fig, animate, frames=len(model_info),
                                interval=300, blit=False, repeat=True)
 
 plt.tight_layout()
+
+print("✅ Animación lista. Ejecuta 'anim' en la siguiente celda para visualizar.")
+print("="*60 + "\n")
 
 anim
 NUM_RUNS = 100
@@ -1058,6 +1396,8 @@ for i in range(NUM_RUNS):
         width=8,
         height=6,
         num_agents=6,
+        num_apagafuegos=3,
+        num_rescatistas=3
     )
 
     steps = 0
@@ -1108,21 +1448,9 @@ plt.show()
 df["dead"].plot(kind="line")
 plt.title("Víctimas muertas por corrida")
 plt.show()
-params = {"width":8, "height":6, "num_agents":6}
 
-MAX_ITERATIONS = 10
-MAX_STEPS = 500
-
-results = batch_run(
-    FoodCollectionModel,
-    parameters=params,
-    iterations=MAX_ITERATIONS,
-    max_steps=MAX_STEPS,
-    number_processes=1,
-    data_collection_period=1,
-    display_progress=True,
-)
 '''''
+
 # ==========================================
 # GESTOR DE SIMULACIÓN GLOBAL
 # ==========================================
