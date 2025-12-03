@@ -1284,6 +1284,7 @@ class Server(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         self._set_response()
 
+    #Aqui podemos consultar los endpoints que tenemos
     def do_GET(self):
         logging.info("GET request, Path: %s", str(self.path))
         self._set_response()
@@ -1298,7 +1299,9 @@ class Server(BaseHTTPRequestHandler):
             ]
         }
         self.wfile.write(json.dumps(response).encode('utf-8'))  
-    
+
+
+    #Aqui manejamos el post segú el request que haga el servidor de unity
     def do_POST(self):
         """Maneja todas las solicitudes POST"""
         try:
@@ -1433,9 +1436,9 @@ def run(server_class=HTTPServer, handler_class=Server, port=8585):
     logging.info("Servidor detenido")
 
 
-# ==========================================
+# 
 # PUNTO DE ENTRADA
-# ==========================================
+# 
 if __name__ == '__main__':
     from sys import argv
     
