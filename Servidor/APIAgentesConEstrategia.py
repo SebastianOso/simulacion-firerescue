@@ -1450,19 +1450,11 @@ plt.title("Víctimas muertas por corrida")
 plt.show()
 
 '''''
-
-# ==========================================
-# GESTOR DE SIMULACIÓN GLOBAL
-# ==========================================
-# Este diccionario almacenará las simulaciones activas por ID
-# ==========================================
-# GESTOR DE SIMULACIÓN GLOBAL
-# ==========================================
 simulaciones_activas = {}
 
 class SimulacionManager:
     """
-    Maneja el ciclo de vida de una simulación:
+    Maneja el ciclo de vida de la simulación:
     - Inicialización del modelo
     - Avance step por step
     - Recolección de datos del estado actual
@@ -1478,10 +1470,10 @@ class SimulacionManager:
         Genera un JSON con el estado actual completo de la simulación
         Incluye: celdas, agentes, paredes, y estadísticas
         """
-        # 1. Obtener el grid actual
+        # Obtenemos el grid actual
         grid_state = get_grid(self.model)
         
-        # 2. Recolectar información de todos los agentes
+        # Recolectamos la información de todos los agentes
         agents_data = []
         for agent in self.model.lista_agentes:
             agents_data.append({
@@ -1497,26 +1489,29 @@ class SimulacionManager:
                 "veces_afectado": agent.veces_afectado_explosion
             })
         
-        # 3. Convertir el grid a lista de celdas
+        # Convertir el grid a lista de celdas
         celdas_estado = []
 
         for y in range(self.model.grid.height):
             for x in range(self.model.grid.width):
-
+                
+                # Lista de todos los objetos que existen en una celda
                 objetos = []
 
-                # Primero agrega fuego/humo/POIs/víctimas
+                # Contenido: Fuego, Humo, POI, víctimas
                 contenido = self.model.cells[x][y]
                 if contenido != 0:
                     objetos.append(int(contenido))
 
-                # Luego agrega agentes que estén en esa celda
+                # Agentes de cada celda
                 agentes_en_celda = self.model.grid.get_cell_list_contents([(x, y)])
                 for ag in agentes_en_celda:
                     if isinstance(ag, Cascanueces):
+
+                        #Pueden ser dos tipos de agentes, con o sin víctimas
                         objetos.append(7 if ag.carrying else 6)
 
-                # Finalmente agrega base (si aplica)
+                # Bases
                 if (x, y) in [
                     self.model.pos_base1,
                     self.model.pos_base2,
@@ -1534,7 +1529,7 @@ class SimulacionManager:
                     })
 
         
-        # 4. Obtener estado de paredes
+        #Estado de las paredes
         paredes_estado = []
         for y in range(len(self.model.walls)):
             for x in range(len(self.model.walls[0])):
@@ -1550,7 +1545,7 @@ class SimulacionManager:
                     "puerta": wall_cell["puerta"]
                 })
         
-        # 5. Ensamblar el estado completo
+        # Estado completo
         state = {
             "step": self.step_count,
             "game_over": self.game_finished,
@@ -1571,6 +1566,7 @@ class SimulacionManager:
         
         return state
     
+    #Método para controlar la simulacíon 
     def advance_step(self):
         """Avanza la simulación un step y retorna el nuevo estado"""
         if not self.game_finished:
@@ -1612,11 +1608,9 @@ class Server(BaseHTTPRequestHandler):
         self.end_headers()
     
     def do_OPTIONS(self):
-        """Maneja solicitudes OPTIONS para CORS"""
         self._set_response()
 
     def do_GET(self):
-        """Información general del servidor"""
         logging.info("GET request, Path: %s", str(self.path))
         self._set_response()
         response = {
@@ -1650,7 +1644,7 @@ class Server(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(tablero_json).encode('utf-8'))
                 logging.info("Tablero enviado")
             
-            # ENDPOINT: iniciar
+            # ENDPOINT iniciar : Configuración inicial de todo el tablero
             elif request_type == "iniciar":
                 width = request_data.get("width", 8)
                 height = request_data.get("height", 6)
@@ -1666,7 +1660,7 @@ class Server(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(estado_inicial).encode('utf-8'))
                 logging.info(f"Simulación '{sim_id}' iniciada")
             
-            # ENDPOINT: step
+            # ENDPOINT: step : Nos permite avanzar la simulación por turnos
             elif request_type == "step":
                 sim_id = request_data.get("simulation_id", "default")
                 
@@ -1682,7 +1676,7 @@ class Server(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(nuevo_estado).encode('utf-8'))
                 logging.info(f"Step {nuevo_estado['step']} ejecutado")
             
-            # ENDPOINT: estado
+            # ENDPOINT: estado : Consultamos el estado actual sin avanzar la simulación
             elif request_type == "estado":
                 sim_id = request_data.get("simulation_id", "default")
                 
